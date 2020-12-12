@@ -2,22 +2,34 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <unistd.h>
-#include <string>
 #include <errno.h>
 #include <netinet/in.h>
 #include <libnet.h>
 #include <netinet/in.h>
 #include <pcap.h>
+#include <string>
+#include <map>
+#include <vector>
+#include <algorithm>
 
 #include "main.h"
 
-char pattern[MAX_PATTERN_LEN];
-int size_pattern;
-Mac my_mac;
+std::map<uint64_t, int> seq;
 
 void usage() {
 	puts("syntax : airodump <interface>");
 	puts("sample : airodump mon0");
+}
+
+uint64_t to_ll(Mac m) {
+    return (
+        (uint64_t)m.mac_[0] 
+        || (uint64_t)m.mac_[1] << 0x8
+        || (uint64_t)m.mac_[2] << 0x10
+        || (uint64_t)m.mac_[3] << 0x18
+        || (uint64_t)m.mac_[4] << 0x20
+        || (uint64_t)m.mac_[5] << 0x28
+    );
 }
 
 void dump(char* buf, int size) {
@@ -28,132 +40,37 @@ void dump(char* buf, int size) {
     puts("");
 }
 
-Mac get_my_mac(const char* dev) {
-    struct ifreq ifr;
-    int fd = socket(PF_INET, SOCK_DGRAM, IPPROTO_IP);
-    char buf[32];
-
-    strncpy(ifr.ifr_name, dev, IFNAMSIZ);
-    if (ioctl(fd, SIOCGIFHWADDR, &ifr) != 0) {
-        puts("Error");
-        close(fd);
-        exit(1);
-    }
-    else {
-        close(fd);
-        for (int i=0; i<MAC_ADDR_LEN; i++) 
-            sprintf(&buf[i*3],"%02x:",((unsigned char*)ifr.ifr_hwaddr.sa_data)[i]);
-        buf[MAC_ADDR_LEN*3 - 1]='\0';
-        return Mac(buf);
-    }
+bool is_beacon_frame(const u_char* packet) {
+    radiotap_hdr_t* pk_radiotap_hdr = (radiotap_hdr_t*)packet;
+    beacon_t* pk_beacon = (beacon_t*)(packet+pk_radiotap_hdr->len);
+    if (ntohs(pk_beacon->type) != Beacon::Type::BEACON_FRAME) return false;
+    
+    return true;
 }
 
-bool match_pattern(const u_char* packet, int size) {
-    int size_data = size - sizeof(TcpPacketHdr);
-    const u_char* data = packet + sizeof(TcpPacketHdr);
-
-    return kmp((char*)data, size_data, pattern, size_pattern);
-    //if (strstr(data, pattern) == nullptr) return false;
-    //else return true;
+bool find_seq(Mac bssid) {
+    return seq.find(to_ll(bssid)) != seq.end();
 }
 
-void send_packet(pcap_t* handle, tcp_packet_hdr_t* packet, int size) {
-    int res = pcap_sendpacket(handle, reinterpret_cast<const u_char*>(packet), size);
-    if (res != 0) {
-        fprintf(stderr, "pcap_sendpacket return %d error=%s\n", res, pcap_geterr(handle));
-        return;
-    }
-}
+void print_frame_info(const u_char* packet) {
+    radiotap_hdr_t* pk_radiotap_hdr = (radiotap_hdr_t*)packet;
+    beacon_t* pk_beacon = (beacon_t*)(packet+pk_radiotap_hdr->len);
+    wireless_management_t* pk_wireman = (wireless_management_t*)((char*)pk_beacon+sizeof(Beacon));
 
-uint32_t wrapsum(uint16_t* buf, int size) {
-    uint32_t cksum = 0;
+    if (!find_seq(pk_beacon->bssid)) seq[to_ll(pk_beacon->bssid)] = pk_beacon->seq_num();
 
-    int hsize = size/sizeof(uint16_t) + size%sizeof(uint16_t);
-    for(int i = 0; i < hsize; i++) {  
-        cksum += ntohs(buf[i]);
-        cksum = (cksum & 0xffff) + (cksum >> 16);
-    }
-    return cksum;
-}
+    int beacon = pk_beacon->seq_num() - seq[to_ll(pk_beacon->bssid)];
 
-uint16_t tcp_checksum(tcp_packet_hdr_t *tcphdr, int size) {
-    uint16_t* pseudo_hdr = (uint16_t*)(new PseudoHdr(tcphdr->ip_.sip_, tcphdr->ip_.dip_, size));
-    uint32_t cksum = 0;
-    tcphdr->tcp_.sum_ = 0;
+    printf("[ BSSID ] %s\n", std::string(pk_beacon->bssid).c_str());
+    printf("[ Beacon ] %d\n", beacon);
+    printf("[ ESSID ] ");
+    for (int i=0; i<pk_wireman->tag.len; i++) printf("%c", *(&(pk_wireman->tag.essid_start)+i));
+    printf("\n");
 
-    cksum += wrapsum(pseudo_hdr, sizeof(PseudoHdr));
-    cksum += wrapsum((uint16_t*)&(tcphdr->tcp_), size);
-    cksum = (cksum & 0xffff) + (cksum >> 16);
-
-    delete pseudo_hdr;
-    return htons((uint16_t)(~cksum));
-}
-
-uint16_t ip_checksum(tcp_packet_hdr_t *tcphdr) {
-    int size = tcphdr->ip_.hl_ * BIT32_IN_BYTE;
-    uint32_t cksum = 0;
-    tcphdr->ip_.sum_ = 0;
-
-    cksum += wrapsum((uint16_t*)&(tcphdr->ip_), size);
-    cksum = (cksum & 0xffff) + (cksum >> 16);
-
-    return htons((uint16_t)(~cksum));
-}
-
-void block(pcap_t* handle, tcp_packet_hdr_t* pk_f, tcp_packet_hdr_t* pk_b, int size) {
-    int tcphdr_size = pk_f->tcp_.off_ * BIT32_IN_BYTE;
-    int header_size = ETH_IP4_HEADER_LEN + tcphdr_size;
-    int data_size = size - header_size;
-    int new_size = size - data_size;
-
-    pk_f->ip_.len_ = htons(new_size-sizeof(EthHdr));
-    pk_f->ip_.sum_ = ip_checksum(pk_f);
-    pk_f->tcp_.seq_ += htonl(data_size);
-    pk_f->tcp_.flags_ = (TcpHdr::RST|TcpHdr::ACK);
-    pk_f->tcp_.sum_ = tcp_checksum(pk_f, tcphdr_size);
-	send_packet(handle, pk_f, new_size);
-
-    Mac tmp_mac(pk_b->eth_.smac_);
-    pk_b->eth_.smac_ = pk_b->eth_.dmac_;
-    pk_b->eth_.dmac_ = tmp_mac;
-
-    Ip tmp_ip(pk_b->ip_.sip_);
-    pk_b->ip_.sip_ = pk_b->ip_.dip_;
-    pk_b->ip_.dip_ = tmp_ip;
-    pk_b->ip_.len_ = htons(new_size-sizeof(EthHdr)+sizeof(BLOCK_MESSAGE));
-    pk_b->ip_.sum_ = ip_checksum(pk_b);
-
-    uint16_t tmp_port = pk_b->tcp_.sport_;
-    pk_b->tcp_.sport_ = pk_b->tcp_.dport_;
-    pk_b->tcp_.dport_ = tmp_port;
-    pk_b->tcp_.seq_ = pk_f->tcp_.ack_;
-    pk_b->tcp_.ack_ = htonl(ntohl(pk_f->tcp_.seq_));
-    pk_b->tcp_.flags_ = (TcpHdr::FIN|TcpHdr::ACK);
-    strncpy(((char*)pk_b)+header_size, BLOCK_MESSAGE, sizeof(BLOCK_MESSAGE));
-    pk_b->tcp_.sum_ = tcp_checksum(pk_b, tcphdr_size+sizeof(BLOCK_MESSAGE));
-
-	send_packet(handle, pk_b, new_size+sizeof(BLOCK_MESSAGE));
-}
-
-
-void handle_packet(pcap_t* handle, const u_char* packet, int size) {
-    if (!match_pattern(packet, size)) return;
-    puts("matched");
-
-    u_char* pk_f = (u_char*)malloc(sizeof(TcpPacketHdr));
-    u_char* pk_b = (u_char*)malloc(sizeof(TcpPacketHdr)+sizeof(BLOCK_MESSAGE));
-
-    memcpy(pk_f, packet, sizeof(TcpPacketHdr));
-    memcpy(pk_b, packet, sizeof(TcpPacketHdr));
-
-    block(handle, (tcp_packet_hdr_t*)pk_f, (tcp_packet_hdr_t*)pk_b, size);
-
-    free(pk_f);
-    free(pk_b);
 }
 
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
+    if (argc != 2) {
         usage();
         return -1;
     }
@@ -166,14 +83,6 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    size_pattern = (int)strlen(argv[2]);
-    strncpy(pattern, argv[2], size_pattern);
-
-    my_mac = get_my_mac(dev);
-
-    printf("%s\n", pattern);
-    printf("%d\n", size_pattern);
-
     while (true) {
         struct pcap_pkthdr* header;
         const u_char* packet;
@@ -185,7 +94,8 @@ int main(int argc, char* argv[]) {
             break;
         }
 
-        handle_packet(handle, packet, header->caplen);
+        if (is_beacon_frame(packet)) 
+        print_frame_info(packet);
     }
 
     pcap_close(handle);
