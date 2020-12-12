@@ -1,0 +1,5 @@
+airodump
+*.o
+header/*.o
+header/scheme/*.o
+*.pcap
